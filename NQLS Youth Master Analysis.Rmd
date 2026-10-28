@@ -1,0 +1,2121 @@
+---
+title: "NQLS Youth Master Analysis"
+author: "Ellie Nienaber, Eric Youngstrom"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+This file consolidates the normative, clinical, cross-sample, validity, IRT, DIF, retest, cross-informant, and norming analyses for the youth NQLS. Analytic choices follow the 5040 Standardized Psychometric Protocol. Where the source files differ, the verified `NQLS_youth_protocol_v1.qmd` implementation is used.
+
+# 1 Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "tidyverse", "haven", "readxl", "lubridate", "psych", "nFactors",
+  "lavaan", "semTools", "mirt", "lordif", "cocor", "gamlss"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install the following packages before running this file: ",
+       paste(missing_packages, collapse = ", "))
+}
+
+library(tidyverse)
+library(haven)
+library(readxl)
+library(lubridate)
+library(psych)
+library(nFactors)
+library(lavaan)
+library(semTools)
+library(mirt)
+library(lordif)
+library(cocor)
+library(gamlss)
+
+select <- dplyr::select
+set.seed(2112)
+
+# Update only these paths when the data move/change. The verified combined file is preferred; the original 1,008-youth file remains a fallback.
+normative_file <- read_sav("scored_child_12_18_1008dyads_9.1.26.sav")
+parent_file <- read_sav("scored_parent_12_18_alldyad_N1008_9.1.26.sav")
+clinical_file  <- read_xlsx("V2_NQLS_Baseline_Clinical.xlsx")
+
+ord_items_y <- paste0("nqlsy0", 1:7)
+general_items_y <- c("nqlsy01", "nqlsy02", "nqlsy05", "nqlsy06", "nqlsy07")
+school_items_y  <- c("nqlsy03", "nqlsy04")
+nqls_subscales_y <- list(General = general_items_y, School = school_items_y)
+nqls_full_y <- list(Total = ord_items_y, General = general_items_y, School = school_items_y)
+
+clinical_items <- c(
+  "NQLS_Friends", "NQLS_Family", "NQLS_Grades", "NQLS_School",
+  "NQLS_Health", "NQLS_Life", "NQLS_Future"
+)
+
+norm_to_clinical <- c(
+  nqlsy01 = "NQLS_Friends", nqlsy02 = "NQLS_Family",
+  nqlsy03 = "NQLS_Grades",  nqlsy04 = "NQLS_School",
+  nqlsy05 = "NQLS_Health",  nqlsy06 = "NQLS_Life",
+  nqlsy07 = "NQLS_Future"
+)
+
+# Verified partial-scalar solution from the clinical comparison notebook.
+# Recheck lavTestScore() whenever the clinical dataset changes.
+thresholds_to_free <- c("NQLS_Life|t3")
+
+prorated_sum <- function(data, items, min_answered) {
+  n_answered <- rowSums(!is.na(data[items]))
+  ifelse(n_answered >= min_answered,
+         rowMeans(data[items], na.rm = TRUE) * length(items), NA_real_)
+}
+
+fit_values <- function(fit) {
+  requested <- c(
+    "chisq.scaled", "df.scaled", "pvalue.scaled", "cfi.scaled", "tli.scaled",
+    "rmsea.scaled", "rmsea.ci.lower.scaled", "rmsea.ci.upper.scaled", "srmr"
+  )
+  available <- intersect(requested, names(lavaan::fitMeasures(fit)))
+  out <- unclass(lavaan::fitMeasures(fit, available))
+  setNames(out, sub("\\.scaled$", "", names(out)))
+}
+```
+
+# 2 Import and prepare the normative data
+
+```{r normative-data}
+fulldata <- normative_file
+df_raw <- fulldata
+df <- haven::zap_labels(df_raw)
+
+stopifnot(all(ord_items_y %in% names(df)))
+
+# Codes 8 and 9 are labelled skipped/not asked and must not enter scoring.
+df <- df %>%
+  mutate(across(all_of(ord_items_y), ~ replace(as.numeric(.x), .x %in% c(8, 9), NA_real_)))
+
+item_labels_y <- vapply(ord_items_y, function(x) {
+  label <- attr(df_raw[[x]], "label")
+  if (is.null(label)) x else as.character(label)
+}, character(1))
+
+range_check_y <- map_dfr(ord_items_y, ~ tibble(
+  item = .x,
+  minimum = min(df[[.x]], na.rm = TRUE),
+  maximum = max(df[[.x]], na.rm = TRUE),
+  n_missing = sum(is.na(df[[.x]]))
+))
+range_check_y
+stopifnot(all(range_check_y$minimum >= 0), all(range_check_y$maximum <= 4))
+
+has_nqlsy_complete <- complete.cases(df[ord_items_y])
+nqlsGoodItems <- df[has_nqlsy_complete, ord_items_y]
+
+nqlsGoodSchoolItems <- nqlsGoodItems %>% 
+  select(all_of(school_items_y))
+nqlsGoodGeneralItems <- nqlsGoodItems %>% 
+  select(all_of(general_items_y))
+
+age_source_y <- if ("actual_age.youth" %in% names(df)) {
+  "actual_age.youth"
+} else if ("actual_age" %in% names(df)) {
+  "actual_age"
+} else {
+  "age_child"
+}
+
+# Preserve the variable names used in the original normative file.
+youth_nqls <- df %>%
+  transmute(
+    caseid,
+    age_child = as.numeric(.data[[age_source_y]]),
+    across(any_of(c("sex_child", "sex_select", names(df)[startsWith(names(df), "race_")]))),
+    across(all_of(ord_items_y)),
+    nqlsytot = prorated_sum(cur_data(), ord_items_y, min_answered = 6),
+    nqlsysubscalelife = prorated_sum(cur_data(), general_items_y, min_answered = 4),
+    nqlsysubscaleschool = ifelse(
+      complete.cases(cur_data()[school_items_y]),
+      rowSums(cur_data()[school_items_y]), NA_real_
+    )
+  ) %>%
+  mutate(across(starts_with("race_"), ~ ifelse(.x == 2, 0, .x)))
+
+# Verify the supplied total rather than assuming it is correct.
+fresh_total_y <- rowSums(df[ord_items_y])
+if ("nqlsytot" %in% names(df)) {
+  total_check_y <- tibble(
+    n_compared = sum(!is.na(df$nqlsytot) & has_nqlsy_complete),
+    mean_abs_difference = mean(
+      abs(df$nqlsytot[has_nqlsy_complete] - fresh_total_y[has_nqlsy_complete]),
+      na.rm = TRUE
+    ),
+    max_abs_difference = max(
+      abs(df$nqlsytot[has_nqlsy_complete] - fresh_total_y[has_nqlsy_complete]),
+      na.rm = TRUE
+    )
+  )
+  total_check_y
+}
+```
+
+```{r}
+insurance <- parent_file %>% 
+  select(healthinsur_srg_1:healthinsur_srg_99)
+table(insurance$healthinsur_srg_1)
+table(insurance$healthinsur_srg_2)
+table(insurance$healthinsur_srg_3)
+table(insurance$healthinsur_srg_4)
+table(insurance$healthinsur_srg_5)
+table(insurance$healthinsur_srg_6)
+table(insurance$healthinsur_srg_7)
+table(insurance$healthinsur_srg_8)
+table(insurance$healthinsur_srg_99)
+```
+
+# 3 Descriptive statistics and sample characteristics
+
+```{r descriptives}
+psych::describe(nqlsGoodItems)[, c("n", "mean", "sd", "median", "min", "max", "skew", "kurtosis")]
+psych::describe(youth_nqls[c("nqlsytot", "nqlsysubscalelife", "nqlsysubscaleschool")])
+
+response_frequencies_y <- lapply(nqlsGoodItems, table)
+response_frequencies_y
+
+ggplot(youth_nqls, aes(nqlsytot)) +
+  geom_histogram(binwidth = 1, boundary = 0, fill = "#53d2fc", color = "white") +
+  scale_x_continuous(breaks = 0:28) +
+  labs(x = "NQLS total score (BENCHMARK)", y = "Count") +
+  theme_minimal()
+```
+
+# 4 Validity analyses
+
+```{r validity-data}
+internal_items_y  <- c("pscy02", "pscy06", "pscy09", "pscy11", "pscy15")
+attention_items_y <- c("pscy01", "pscy03", "pscy07", "pscy13", "pscy17")
+external_items_y  <- c("pscy04", "pscy05", "pscy08", "pscy10", "pscy12", "pscy14", "pscy16")
+
+df <- df %>%
+  mutate(
+    pscy_int = prorated_sum(cur_data(), internal_items_y, 5),
+    pscy_att = prorated_sum(cur_data(), attention_items_y, 5),
+    pscy_ext = prorated_sum(cur_data(), external_items_y, 7),
+    chrtysttot = if (all(paste0("chrty", sprintf("%02d", 1:9)) %in% names(df)))
+      rowSums(across(all_of(paste0("chrty", sprintf("%02d", 1:9)))), na.rm = FALSE) else NA_real_,
+    chrtyprtot = if (all(paste0("chrty", sprintf("%02d", 10:12)) %in% names(df)))
+      rowSums(across(all_of(paste0("chrty", sprintf("%02d", 10:12)))), na.rm = FALSE) else NA_real_,
+    vasyiatot = if (all(paste0("vasy", sprintf("%02d", 1:9)) %in% names(df)))
+      rowSums(across(all_of(paste0("vasy", sprintf("%02d", 1:9)))), na.rm = FALSE) else NA_real_,
+    vasyhitot = if (all(paste0("vasy", sprintf("%02d", 10:18)) %in% names(df)))
+      rowSums(across(all_of(paste0("vasy", sprintf("%02d", 10:18)))), na.rm = FALSE) else NA_real_
+  )
+
+nqls_validity <- df %>%
+  mutate(
+    nqlsytot = ifelse(has_nqlsy_complete, rowSums(across(all_of(ord_items_y))), NA_real_),
+    nqlsysubscalelife = ifelse(
+      complete.cases(cur_data()[general_items_y]), rowSums(across(all_of(general_items_y))), NA_real_
+    ),
+    nqlsysubscaleschool = ifelse(
+      complete.cases(cur_data()[school_items_y]), rowSums(across(all_of(school_items_y))), NA_real_
+    ),
+    ngaugey01_rescored = case_when(
+      ngaugey01 %in% 0:5 ~ as.numeric(ngaugey01),
+      ngaugey01 %in% c(6, 7, 10, 11, 12, 13) ~ match(ngaugey01, c(6, 7, 10, 11, 12, 13)) - 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+validity_outcomes_y <- intersect(
+  c("vqidsytot", "chrtytot", "chrtysttot", "chrtyprtot", "pscytot", "pscy_int",
+    "pscy_att", "pscy_ext", "vasysxtot", "vasyiatot", "vasyhitot",
+    "vasyperftot", "ngaugey01_rescored"),
+  names(nqls_validity)
+)
+
+nqls_scores_y <- c("nqlsytot", "nqlsysubscalelife", "nqlsysubscaleschool")
+
+correlation_results_y <- crossing(score = nqls_scores_y, outcome = validity_outcomes_y) %>%
+  mutate(result = map2(score, outcome, ~ {
+    keep <- complete.cases(nqls_validity[c(.x, .y)])
+    test <- cor.test(nqls_validity[[.x]][keep], nqls_validity[[.y]][keep])
+    tibble(
+      n = sum(keep), r = unname(test$estimate),
+      ci_low = test$conf.int[1], ci_high = test$conf.int[2], p = test$p.value
+    )
+  })) %>%
+  unnest(result) %>%
+  mutate(p_fdr = p.adjust(p, method = "BH"))
+
+correlation_results_y
+```
+
+```{r compare-validity-correlations}
+compare_dependent_correlations <- function(data, outcome, score_1, score_2) {
+
+  # Steiger's test requires all three correlations to come
+  # from the same complete cases
+  complete_data <- data %>%
+    dplyr::select(
+      all_of(c(outcome, score_1, score_2))
+    ) %>%
+    filter(complete.cases(.))
+
+  n <- nrow(complete_data)
+
+  # Correlations with the common external measure
+  r_1 <- cor(
+    complete_data[[outcome]],
+    complete_data[[score_1]],
+    method = "pearson"
+  )
+
+  r_2 <- cor(
+    complete_data[[outcome]],
+    complete_data[[score_2]],
+    method = "pearson"
+  )
+
+  # Correlation between the two NQLS scores
+  r_12 <- cor(
+    complete_data[[score_1]],
+    complete_data[[score_2]],
+    method = "pearson"
+  )
+
+  # Fisher's z-prime
+  fisher_z_1 <- atanh(r_1)
+  fisher_z_2 <- atanh(r_2)
+
+  # Cohen's q
+  cohens_q <- fisher_z_1 - fisher_z_2
+
+  # Steiger test for dependent, overlapping correlations
+  steiger_result <- cocor::cocor.dep.groups.overlap(
+    r.jk = r_1,
+    r.jh = r_2,
+    r.kh = r_12,
+    n = n,
+    alternative = "two.sided",
+    test = "steiger1980",
+    var.labels = c(outcome, score_1, score_2)
+  )
+
+  tibble(
+    outcome = outcome,
+    score_1 = score_1,
+    score_2 = score_2,
+    n = n,
+    r_1 = r_1,
+    r_2 = r_2,
+    delta_r = r_1 - r_2,
+    r_between_scores = r_12,
+    fisher_z_1 = fisher_z_1,
+    fisher_z_2 = fisher_z_2,
+    cohens_q = cohens_q,
+    abs_q = abs(cohens_q),
+    q_interpretation = case_when(
+      abs_q < .10 ~ "Negligible",
+      abs_q < .30 ~ "Small",
+      abs_q < .50 ~ "Medium",
+      TRUE ~ "Large"
+    ),
+    steiger_z = unname(
+      steiger_result@steiger1980$statistic
+    ),
+    p_value = steiger_result@steiger1980$p.value
+  )
+}
+```
+
+```{r}
+contrasts <- tribble(
+  ~score_1,            ~score_2,
+  "nqlsytot",    "nqlsysubscalelife",
+  "nqlsytot",    "nqlsysubscaleschool",
+  "nqlsysubscalelife",  "nqlsysubscaleschool"
+)
+
+# PSC-17 subscales use the freshly-prorated pscy_int/pscy_att/pscy_ext (defined
+# in the validity-data chunk above from raw items), not the precomputed
+# pscyintot/pscyexttot/pscyatttot columns -- standardized to match the Table 4
+# pipeline (validity_outcomes_y, above), which already used the fresh-recompute
+# versions. Protocol Section 2 (v1.34) requires verifying any precomputed *tot
+# column's coverage against its own raw items before trusting it; these
+# precomputed subscale totals were never put through that check, so this
+# removes an unverified dependency rather than relying on the two pipelines'
+# numbers having happened to agree so far. N-Gauge is likewise standardized to
+# the cleaned ngaugey01_rescored (built in the validity-data chunk) instead of
+# the raw ngaugey01, which still carries uncleaned skip/response codes
+# (6, 7, 10-13) that previously produced a materially different, wrong
+# correlation here than in Table 4's pipeline.
+outcomes <- c(
+  "VQIDS Depression"                 = "vqidsytot",
+  "CHRT Suicide Risk + AF"           = "chrtytot",
+  "CHRT Propensity"                  = "chrtyprtot",
+  "CHRT Suicidal Thoughts"           = "chrtysttot",
+  "PSC-17 General MEB Problems"      = "pscytot",
+  "PSC-17 Internalizing"             = "pscy_int",
+  "PSC-17 Externalizing"             = "pscy_ext",
+  "PSC-17 Attention"                 = "pscy_att",
+  "VADRS ADHD"                       = "vasysxtot",
+  "VADRS Hyperactivity/Impulsivity"  = "vasyhitot",
+  "VADRS Inattention"                = "vasyiatot",
+  "VADRS Performance"                = "vasyperftot",
+  "N-Gauge Emotional Severity"       = "ngaugey01_rescored"
+)
+```
+
+```{r}
+correlation_comparisons <- purrr::imap_dfr(
+  outcomes,
+  function(outcome_variable, outcome_label) {
+
+    purrr::pmap_dfr(
+      contrasts,
+      function(score_1, score_2) {
+
+        compare_dependent_correlations(
+          data = nqls_validity,
+          outcome = outcome_variable,
+          score_1 = score_1,
+          score_2 = score_2
+        ) %>%
+          mutate(
+            measure = outcome_label,
+            contrast = paste(score_1, "vs.", score_2),
+            .before = 1
+          )
+      }
+    )
+  }
+)
+
+correlation_comparisons <- correlation_comparisons %>%
+  mutate(
+    p_fdr = p.adjust(p_value, method = "BH"),
+    significant = if_else(p_fdr < .05, "Yes", "No")
+  )
+```
+
+```{r}
+correlation_comparisons %>%
+  select(
+    measure,
+    contrast,
+    n,
+    r_1,
+    r_2,
+    delta_r,
+    fisher_z_1,
+    fisher_z_2,
+    cohens_q,
+    q_interpretation,
+    steiger_z,
+    p_value,
+    p_fdr,
+    significant
+  ) %>%
+  mutate(
+    across(
+      c(
+        r_1, r_2, delta_r,
+        fisher_z_1, fisher_z_2,
+        cohens_q, steiger_z
+      ),
+      ~ round(.x, 3)
+    ),
+    across(
+      c(p_value, p_fdr),
+      ~ round(.x, 4)
+    )
+  )
+```
+```{r}
+results_table <- correlation_comparisons %>%
+  transmute(
+    Measure = measure,
+    Comparison = contrast,
+    n,
+    r1 = r_1,
+    r2 = r_2,
+    Cohens_q = cohens_q,
+    Steiger_z = steiger_z,
+    p_FDR = p_fdr
+  ) %>%
+  mutate(
+    across(
+      c(r1, r2, Cohens_q, Steiger_z),
+      ~ round(.x, 2)
+    ),
+    p_FDR = case_when(
+      p_FDR < .001 ~ "<.001",
+      TRUE ~ sub("^0", "", sprintf("%.3f", p_FDR))
+    )
+  )
+results_table
+```
+
+# 5 Exploratory factor analysis
+
+```{r efa}
+poly_matrix_y <- psych::polychoric(nqlsGoodItems)$rho
+n_obs_y <- nrow(nqlsGoodItems)
+n_vars_y <- ncol(nqlsGoodItems)
+ev_poly_y <- eigen(poly_matrix_y)$values
+
+bartlett_y <- psych::cortest.bartlett(poly_matrix_y, n = n_obs_y)
+bartlett_y
+kmo_y <- psych::KMO(poly_matrix_y)
+kmo_y
+
+parallel_pc_y <- psych::fa.parallel(
+  poly_matrix_y, n.obs = n_obs_y, fa = "pc", plot = FALSE
+)
+parallel_fa_y <- psych::fa.parallel(
+  poly_matrix_y, n.obs = n_obs_y, fa = "fa", fm = "wls", plot = FALSE
+)
+parallel_nf_y <- nFactors::parallel(
+  subject = n_obs_y, var = n_vars_y, rep = 1000, cent = .95
+)
+scree_y <- nFactors::nScree(
+  x = ev_poly_y, aparallel = parallel_nf_y$eigen$qevpea, model = "factors"
+)
+map_y <- psych::VSS(poly_matrix_y, n = 4, rotate = "promax", fm = "wls", plot = FALSE)
+
+retention_summary_y <- tibble(
+  method = c("Parallel analysis (PC)", "Parallel analysis (FA)",
+             "Optimal coordinates", "Acceleration factor", "MAP"),
+  factors = c(parallel_pc_y$ncomp, parallel_fa_y$nfact,
+              scree_y$Components$noc, scree_y$Components$naf,
+              which.min(map_y$map))
+)
+retention_summary_y
+
+efa_1f_y <- psych::fa(
+  poly_matrix_y, nfactors = 1, n.obs = n_obs_y, rotate = "none", fm = "wls"
+)
+efa_2f_y <- psych::fa(
+  poly_matrix_y, nfactors = 2, n.obs = n_obs_y, rotate = "promax", fm = "wls"
+)
+print(efa_1f_y$loadings, cutoff = .30)
+efa_1f_y
+print(efa_2f_y$loadings, cutoff = .30)
+efa_2f_y
+```
+
+# 6 Confirmatory factor analysis and structural decision
+
+```{r cfa}
+model_1f_y <- '
+  Total =~ nqlsy01 + nqlsy02 + nqlsy03 + nqlsy04 + nqlsy05 + nqlsy06 + nqlsy07
+'
+model_2f_y <- '
+  General =~ nqlsy01 + nqlsy02 + nqlsy05 + nqlsy06 + nqlsy07
+  School  =~ nqlsy03 + nqlsy04
+'
+model_bifactor_y <- '
+  Total =~ nqlsy01 + nqlsy02 + nqlsy03 + nqlsy04 + nqlsy05 + nqlsy06 + nqlsy07
+  General =~ nqlsy01 + nqlsy02 + nqlsy05 + nqlsy06 + nqlsy07
+  School  =~ nqlsy03 + nqlsy04
+'
+
+fit_1f_y <- lavaan::cfa(
+  model_1f_y, data = nqlsGoodItems, ordered = ord_items_y,
+  estimator = "WLSMV", std.lv = TRUE, missing = "pairwise"
+)
+fit_1f_y
+fit_2f_y <- lavaan::cfa(
+  model_2f_y, data = nqlsGoodItems, ordered = ord_items_y,
+  estimator = "WLSMV", std.lv = TRUE, missing = "pairwise"
+)
+fit_bifactor_y <- tryCatch(
+  lavaan::cfa(
+    model_bifactor_y, data = nqlsGoodItems, ordered = ord_items_y,
+    estimator = "WLSMV", std.lv = TRUE, orthogonal = TRUE,
+    control = list(iter.max = 20000, eval.max = 20000)
+  ),
+  error = function(e) NULL
+)
+
+cfa_fits_y <- list(`1 factor` = fit_1f_y, `2 correlated factors` = fit_2f_y)
+if (!is.null(fit_bifactor_y) && lavInspect(fit_bifactor_y, "converged")) {
+  cfa_fits_y$Bifactor <- fit_bifactor_y
+}
+
+cfa_comparison_y <- imap_dfr(cfa_fits_y, ~ {
+  as_tibble_row(fit_values(.x)) %>% mutate(model = .y, .before = 1)
+})
+cfa_comparison_y
+lavInspect(fit_2f_y, "cor.lv")
+
+fit_1f_y
+summary(fit_1f_y, fit.measures = TRUE, standardized = TRUE)
+fit_2f_y
+summary(fit_2f_y, fit.measures = TRUE, standardized = TRUE)
+
+# AIC and BIC are not available for WLSMV models.
+```
+```{r}
+get_ecv <- function(o) {
+  if (!is.null(o$ECV)) return(round(as.numeric(o$ECV)[1], 2))
+  sl <- tryCatch(o$schmid$sl, error = function(e) NULL)
+  if (is.null(sl)) return(NA_real_)
+  cn <- colnames(sl)
+  gcol <- which(cn == "g")
+  fcol <- grep("^F[0-9]+\\*?$", cn)
+  if (length(gcol) != 1 || length(fcol) == 0) return(NA_real_)
+  g2  <- sum(sl[, gcol]^2, na.rm = TRUE)
+  tot <- g2 + sum(sl[, fcol]^2, na.rm = TRUE)
+  if (tot == 0) NA_real_ else round(g2 / tot, 2)
+}
+
+univocality_indices <- function(df, items, nf) {
+  X <- df[complete.cases(df[items]), items]
+  ev_ratio <- tryCatch({
+    invisible(capture.output(
+      pa <- psych::fa.parallel(X, fa = "fa", cor = "poly", plot = FALSE)
+    ))
+    v <- pa$fa.values
+    if (length(v) >= 2 && !any(is.na(v[1:2]))) round(v[1] / v[2], 1) else NA_real_
+  }, error = function(e) NA_real_)
+  out <- c(EV1_EV2 = ev_ratio, omega_h = NA_real_, omega_tot = NA_real_, ECV = NA_real_)
+  o <- tryCatch(psych::omega(X, nfactors = max(nf, 1L), poly = TRUE, plot = FALSE), error = function(e) NULL)
+  if (!is.null(o)) {
+    out["omega_tot"] <- round(as.numeric(o$omega.tot)[1], 2)
+    if (nf >= 2) {
+      out["omega_h"] <- round(as.numeric(o$omega_h)[1], 2)
+      out["ECV"] <- get_ecv(o)
+    }
+  }
+  out
+}
+
+h_coefficient <- function(lambda) {
+  if (any(abs(lambda) >= 1, na.rm = TRUE)) {
+    warning("h_coefficient(): at least one |loading| >= 1 (Heywood case) -- returning NA.")
+    return(NA_real_)
+  }
+  1 / (1 + 1 / sum(lambda^2 / (1 - lambda^2)))
+}
+
+univocality_y <- univocality_indices(nqlsGoodItems, ord_items_y, nf = 2)
+
+check_subscale_unidim <- function(items, label) {
+  X <- nqlsGoodItems[items]
+  poly <- psych::polychoric(X)$rho
+  ev <- eigen(poly)$values
+  om <- tryCatch(psych::omega(X, nfactors = 1, poly = TRUE, plot = FALSE), error = function(e) NULL)
+  al <- psych::alpha(X)
+  data.frame(
+    Subscale = label, n_items = length(items),
+    EV1_EV2 = if (length(ev) >= 2) round(ev[1]/ev[2], 2) else NA,
+    pct_var_F1 = round(100*ev[1]/sum(ev), 1),
+    omega_total = if (!is.null(om)) round(as.numeric(om$omega.tot), 3) else NA,
+    alpha = round(al$total$raw_alpha, 3),
+    AIIC = round(mean(poly[upper.tri(poly)]), 3),
+    r_drop_min = round(min(al$item.stats$r.drop), 3), r_drop_max = round(max(al$item.stats$r.drop), 3)
+  )
+}
+
+full_unidim_y <- do.call(rbind, lapply(names(nqls_full_y), function(nm)
+  check_subscale_unidim(nqls_full_y[[nm]], nm)))
+
+print(full_unidim_y, row.names = FALSE)
+
+ev_ratio_y <- univocality_y["EV1_EV2"]
+ecv_general_y <- suppressWarnings(as.numeric(univocality_y["ECV"]))
+omega_h_val_y <- suppressWarnings(as.numeric(univocality_y["omega_h"]))
+ecv_source_y  <- "psych::omega() Schmid-Leiman (nf=2, general loadings constrained equal for identification) -- CFA route excluded (bifactor did not converge on two independent estimators, per Section 4)"
+
+ecv_ok_y   <- !is.na(ecv_general_y) && ecv_general_y >= 0.60
+omega_ok_y <- !is.na(omega_h_val_y) && omega_h_val_y >= 0.70
+
+bundle_supports_unidim_y <- isTRUE(ecv_ok_y) && isTRUE(omega_ok_y)
+
+grm_structure_decision_mechanical_y <- if (bundle_supports_unidim_y) "standard_or_standard_with_sensitivity" else "two_tier_bifactor"
+
+cat("ECV/omega_H source:", ecv_source_y, "\n")
+cat(sprintf("EV1/EV2 ratio (FA-extraction):  %s\n", ev_ratio_y))
+cat(sprintf("ECV (general):      %s  [target >= .70, floor .60]\n", round(ecv_general_y, 2)))
+cat(sprintf("omega_H (general):  %s  [target >= .70-.80]\n", round(omega_h_val_y, 2)))
+
+```
+
+```{r univocality-and-reliability}
+psych::alpha(nqlsGoodItems)
+weak_items_y <- rownames(alpha_diag_y$item.stats)[alpha_diag_y$item.stats$r.drop < .30]
+
+
+omega_general_y <- psych::omega(
+  nqlsGoodItems[general_items_y], nfactors = 1, poly = TRUE, plot = FALSE
+)
+omega_total_y <- psych::omega(
+  nqlsGoodItems[ord_items_y], nfactors = 2, poly = TRUE, plot = FALSE
+)
+
+# A two-item scale is summarized by its polychoric inter-item correlation and
+# Spearman-Brown reliability; a multi-factor omega decomposition is not identified.
+r_school_y <- poly_matrix_y["nqlsy03", "nqlsy04"]
+spearman_brown_school_y <- 2 * r_school_y / (1 + r_school_y)
+
+reliability_table_y <- tibble(
+  scale = c("Total (legacy only)", "General", "School"),
+  n_items = c(7, 5, 2),
+  alpha = c(
+    alpha_diag_y$total$raw_alpha,
+    psych::alpha(nqlsGoodItems[general_items_y])$total$raw_alpha,
+    psych::alpha(nqlsGoodItems[school_items_y])$total$raw_alpha
+  ),
+  omega_total = c(as.numeric(omega_total_y$omega.tot), as.numeric(omega_general_y$omega.tot), NA_real_),
+  school_spearman_brown = c(NA_real_, NA_real_, spearman_brown_school_y)
+)
+reliability_table_y
+
+# Verified decision: retain General and School as separate scores. The bifactor
+# route is structurally fragile because School has only two indicators.
+scoring_structure_y <- "subset"
+```
+
+# 7 Graded response models
+
+```{r grm-functions}
+exp_score_grm <- function(a, b, theta) {
+  b <- b[is.finite(b)]
+  if (!length(b)) return(rep(NA_real_, length(theta)))
+  rowSums(vapply(b, function(bk) plogis(a * (theta - bk)), numeric(length(theta))))
+}
+
+extract_grm_parameters <- function(fit) {
+  as.data.frame(mirt::coef(fit, IRTpars = TRUE, simplify = TRUE)$items) %>%
+    rownames_to_column("item")
+}
+
+get_m2 <- function(fit) {
+  out <- tryCatch(mirt::M2(fit, type = "C2"), error = function(e) NULL)
+  if (is.null(out)) return(tibble(M2 = NA, df = NA, p = NA, RMSEA = NA, CFI = NA, TLI = NA, SRMSR = NA))
+  tibble(M2 = out$M2, df = out$df, p = out$p, RMSEA = out$RMSEA,
+         CFI = out$CFI, TLI = out$TLI, SRMSR = out$SRMSR)
+}
+```
+
+```{r fit-grms-1}
+grm_fits_y <- imap(nqls_full_y, ~ mirt::mirt(
+  nqlsGoodItems[.x], 1, itemtype = "graded", SE = TRUE, verbose = FALSE
+))
+
+grm_fit_table_y <- imap_dfr(grm_fits_y, ~ get_m2(.x) %>% mutate(scale = .y, .before = 1))
+grm_parameter_table_y <- imap_dfr(
+  grm_fits_y, ~ extract_grm_parameters(.x) %>% mutate(scale = .y, .before = 1)
+)
+grm_fit_table_y
+grm_parameter_table_y
+
+grm_item_fit_y <- imap_dfr(grm_fits_y, ~ {
+  tryCatch(
+    as_tibble(mirt::itemfit(.x, fit_stats = "S_X2"), rownames = "item") %>%
+      mutate(scale = .y, .before = 1),
+    error = function(e) tibble(scale = .y, item = names(nqls_full_y[[.y]]),
+                               note = conditionMessage(e))
+  )
+})
+grm_item_fit_y
+
+# Q3 requires at least three items, so it is run for Total and General only.
+q3_total_y <- residuals(grm_fits_y$Total, type = "Q3")
+q3_total_y
+q3_general_y <- residuals(grm_fits_y$General, type = "Q3")
+q3_general_y
+
+person_fit_y <- imap_dfr(grm_fits_y, ~ {
+  pf <- mirt::personfit(.x, method = "EAP")
+  fit_column <- intersect(c("Zh", "zh", "lz", "z.h", "Z.h"), names(pf))[1]
+  tibble(scale = .y, proportion_flagged = mean(abs(pf[[fit_column]]) > 3, na.rm = TRUE))
+})
+person_fit_y
+```
+
+
+```{r fit-grms-2}
+## Information Plot
+theta_grid_y <- seq(-4, 4, .01)
+information_y <- imap_dfr(grm_fits_y, ~ tibble(
+  scale = .y,
+  theta = theta_grid_y,
+  information = mirt::testinfo(.x, Theta = matrix(theta_grid_y)),
+  conditional_reliability = 1 - 1 / mirt::testinfo(.x, Theta = matrix(theta_grid_y))
+))
+
+ggplot(information_y, aes(theta, information, color = scale)) +
+  geom_line() + theme_minimal()
+```
+
+
+```{r fit-grms-3}
+# 2-Factor GRM
+life_positions <- match(general_items_y, ord_items_y)
+school_positions <- match(school_items_y, ord_items_y)
+
+two_factor_syntax <- paste0(
+  "General = ", paste(life_positions, collapse = ", "), "\n",
+  "School = ", paste(school_positions, collapse = ", "), "\n",
+  "COV = General*School"
+)
+
+model_two_factor <- mirt::mirt.model(two_factor_syntax)
+
+fit_two_factor <- mirt::mirt(
+  data = nqlsGoodItems,
+  model = model_two_factor,
+  itemtype = "graded",
+  method = "EM",
+  SE = TRUE,
+  SE.type = "Oakes",
+  TOL = 1e-4,
+  technical = list(NCYCLES = 3000),
+  verbose = TRUE
+)
+
+fit_two_factor
+get_m2(fit_two_factor)
+grm_fits_y$Total
+get_m2(grm_fits_y$Total)
+```
+
+```{r fit-grms-4}
+## Reliability Plot Function
+plot_reliability <- function(models, labels, colors = NULL,
+                             theta_range = c(-4, 5),
+                             threshold = 0.80,
+                             title = "GRM: Conditional Reliability") {
+
+  if (!is.list(models)) models <- list(models)
+  if (length(models) != length(labels))
+    stop("models and labels must be the same length")
+
+  n_groups <- length(models)
+
+  default_colors <- c("#2166AC", "#D6604D", "#4DAC26", "#7B2D8B")
+  if (is.null(colors)) {
+    colors <- setNames(default_colors[seq_len(n_groups)], labels)
+  } else {
+    colors <- setNames(colors, labels)
+  }
+
+  theta_seq <- seq(theta_range[1], theta_range[2], by = 0.01)
+
+  rxx_list <- lapply(models, function(mod) {
+    info <- testinfo(mod, Theta = matrix(theta_seq))
+    info / (info + 1)
+  })
+
+  rxx_df <- data.frame(
+    theta = rep(theta_seq, n_groups),
+    rxx   = unlist(rxx_list),
+    group = rep(labels, each = length(theta_seq))
+  )
+  rxx_df$group <- factor(rxx_df$group, levels = labels)
+
+  find_crossings <- function(theta, rxx, threshold) {
+    above     <- rxx >= threshold
+    crossings <- which(diff(above) != 0)
+    if (length(crossings) == 0) return(numeric(0))
+    sapply(crossings, function(i) {
+      approx(x = rxx[i:(i+1)], y = theta[i:(i+1)], xout = threshold)$y
+    })
+  }
+
+  cross_list <- lapply(seq_len(n_groups), function(i) {
+    cx <- find_crossings(theta_seq, rxx_list[[i]], threshold)
+    if (length(cx) == 0) return(NULL)
+    data.frame(theta = cx, group = labels[i])
+  })
+
+  endpoints_df <- do.call(rbind, Filter(Negate(is.null), cross_list))
+
+  p <- ggplot(rxx_df, aes(x = theta, y = rxx, color = group)) +
+
+    geom_line(linewidth = 1.1) +
+
+    geom_hline(yintercept = threshold, linetype = "dashed",
+               color = "black", linewidth = 0.7) +
+
+    scale_color_manual(values = colors) +
+    scale_x_continuous(limits = theta_range,
+                       breaks = seq(theta_range[1], theta_range[2] - 1,
+                                    by = 1)) +
+    scale_y_continuous(limits = c(0, 1.00), breaks = seq(0, 1, by = 0.25)) +
+
+    labs(
+      title = title,
+      x     = expression(theta),
+      y     = expression(r[xx]),
+      color = NULL
+    ) +
+
+    theme_classic(base_size = 13) +
+    theme(
+      legend.position   = if (n_groups > 1) c(0.15, 0.88) else "none",
+      legend.background = element_blank(),
+      plot.title        = element_text(hjust = 0.5, face = "bold")
+    )
+
+  if (!is.null(endpoints_df) && nrow(endpoints_df) > 0) {
+    endpoints_df$group <- factor(endpoints_df$group, levels = labels)
+    p <- p +
+      geom_vline(data        = endpoints_df,
+                 aes(xintercept = theta, color = group),
+                 linetype    = 5,
+                 show.legend = FALSE) +
+      ggrepel::geom_label_repel(
+        data          = endpoints_df,
+        aes(x = theta, y = 0, label = sprintf("%.2f", theta), color = group),
+        label.size    = NA,
+        nudge_y       = 0.1,
+        box.padding   = 0.5,
+        point.padding = 0.3,
+        segment.color = NA,
+        show.legend   = FALSE
+      )
+  }
+
+  return(p)
+}
+```
+
+```{r fit-grms-5}
+# ── Single curve: full sample ─────────────────────────────────────────────────
+grm_plot_rxx <- plot_reliability(
+  models = list(grm_fits_y$Total),
+  labels = "Full Sample",
+  title  = "NQLS GRM: Conditional Reliability"
+)
+
+grm_plot_rxx
+
+# ── Two curve: two factors, one sample ────────────────────────────────────────
+grm2_plot_rxx <- plot_reliability(
+  models = list(grm_fits_y$School, grm_fits_y$General),
+  labels = c("School", "General"),
+  title  = "NQLS GRM: Conditional Reliability"
+)
+
+grm2_plot_rxx
+```
+
+```{r}
+## Info x Reliability Function
+detect_itemtype <- function(data) {
+  vapply(data, function(x) {
+    n_levels <- length(unique(na.omit(x)))
+    if (n_levels <= 2) "2PL" else "graded"
+  }, character(1))
+}
+
+fit_grm_analysis <- function(data,
+                              chart_title,
+                              theta_range = seq(-4, 4, by = 0.05)) {
+
+  itemtype <- detect_itemtype(data)
+  message(sprintf("Fitting '%s' with itemtype: %s", chart_title,
+                   paste(itemtype, collapse = ", ")))
+
+  fit <- mirt(data, model = 1, itemtype = itemtype, SE = TRUE)
+  print(fit)
+
+  Theta      <- matrix(theta_range, ncol = 1)
+  test_info  <- testinfo(fit, Theta)
+  cond_rel   <- test_info / (test_info + 1)
+
+  plot_df <- data.frame(theta = theta_range,
+                         information = test_info,
+                         reliability = cond_rel)
+
+  invisible(list(fit = fit, itemtype = itemtype, plot_df = plot_df,
+                 chart_title = chart_title))
+}
+
+## Find the theta values where the reliability curve crosses a given level
+## (default .8), via linear interpolation between adjacent grid points.
+find_reliability_crossings <- function(theta, reliability, level = 0.8) {
+  crossings <- numeric(0)
+  for (i in seq_len(length(theta) - 1)) {
+    r1 <- reliability[i]; r2 <- reliability[i + 1]
+    if (r1 == level) {
+      crossings <- c(crossings, theta[i])
+    } else if ((r1 - level) * (r2 - level) < 0) {
+      t <- theta[i] + (level - r1) * (theta[i + 1] - theta[i]) / (r2 - r1)
+      crossings <- c(crossings, t)
+    }
+  }
+  if (reliability[length(reliability)] == level) {
+    crossings <- c(crossings, theta[length(theta)])
+  }
+  sort(unique(crossings))
+}
+  
+build_grm_plot <- function(grm_fit, rel_cut = 0.8) {
+
+  chart_title <- grm_fit$chart_title
+  plot_df     <- grm_fit$plot_df
+
+  info_max     <- 25                                           # fixed for cross-informant comparison
+  scale_factor <- info_max / 1.0                               # reliability max = 1
+  plot_df$reliability_scaled <- plot_df$reliability * scale_factor
+
+  p <- ggplot(plot_df, aes(x = theta)) +
+    geom_line(aes(y = information, color = "Information"), linewidth = 1.1) +
+    geom_line(aes(y = reliability_scaled, color = "Reliability"), linewidth = 1.1) +
+    scale_y_continuous(
+      name = "Information",
+      limits = c(0, info_max),
+      sec.axis = sec_axis(~ . / scale_factor, name = "Reliability",
+                           breaks = seq(0, 1, 0.2))
+    ) +
+    scale_x_continuous(name = expression("Theta ("*theta*")"),
+                        breaks = seq(-4, 4, 1), limits = c(-4, 4)) +
+    scale_color_manual(name = NULL,
+                        values = c("Information" = "#4C72B0",
+                                   "Reliability" = "#0a7c0e")) +
+    labs(title = chart_title) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+      legend.position = "top",
+      legend.text = element_text(size = 12),
+      axis.title.y.left  = element_text(color = "#4C72B0"),
+      axis.title.y.right = element_text(color = "#0a7c0e"),
+      panel.grid = element_blank()
+    )
+
+  ## Dashed reference lines marking the widest theta range over which
+  ## reliability is at least `rel_cut` -- i.e. the two farthest-apart
+  ## crossings of the reliability curve through rel_cut (curves that dip
+  ## below and back above .8 more than once are collapsed to their
+  ## outermost crossings).
+  if (!is.null(rel_cut)) {
+    crossings <- find_reliability_crossings(plot_df$theta, plot_df$reliability,
+                                             level = rel_cut)
+    if (length(crossings) >= 1) {
+      x_left  <- min(crossings)
+      x_right <- max(crossings)
+      x_nudge  <- diff(range(plot_df$theta)) * 0.015
+      label_df <- data.frame(theta = c(x_left, x_right),
+                              label = sprintf("%.2f", c(x_left, x_right)),
+                              hjust = c(1, 0))
+      p <- p +
+        geom_vline(xintercept = c(x_left, x_right),
+                   color = "#B05C6A", linetype = "dashed") +
+        geom_text(data = label_df,
+                  aes(x = theta + ifelse(hjust == 1, -x_nudge, x_nudge),
+                      y = info_max * 0.97, label = label, hjust = hjust),
+                  inherit.aes = FALSE,
+                  color = "#B05C6A", size = 4, fontface = "bold",
+                  vjust = 1)
+    }
+  }
+
+  p
+}
+
+## Display a plot and save it to disk.
+save_grm_plot <- function(p, output_file,
+                           width = 8, height = 6, dpi = 300) {
+  print(p)
+  ggsave(output_file, plot = p, width = width, height = height, dpi = dpi, bg = "white")
+  cat("Chart saved to:", output_file, "\n")
+  invisible(p)
+}
+```
+
+```{r}
+## Information x Reliability Plot
+## Information x Reliability Plot
+analysis_specs <- list(
+  list(
+    data  = nqlsGoodItems,
+    title = "NQLS Total Score (Self-Report): \nAge Range: 12-18",
+    file  = "nqls_total_youth_info_rel.png"
+  ),
+  list(
+    data  = nqlsGoodGeneralItems,
+    title = "NQLS General Subscore (Self-Report): \nAge Range: 12-18",
+    file  = "nqls_general_youth_info_rel.png"
+  ),
+  list(
+    data  = nqlsGoodSchoolItems,
+    title = "NQLS School Subscore (Self-Report): \nAge Range: 12-18",
+    file  = "nqls_school_youth_info_rel.png"
+  )
+)
+
+## 3a. Fit every model
+grm_fits <- lapply(analysis_specs, function(spec) {
+  fit_grm_analysis(
+    data = spec$data,
+    chart_title = spec$title
+  )
+})
+
+names(grm_fits) <- vapply(
+  analysis_specs,
+  function(spec) spec$file,
+  character(1)
+)
+
+## 3b. Build each plot
+grm_plots <- lapply(grm_fits, function(grm_fit) {
+  build_grm_plot(grm_fit)
+})
+
+names(grm_plots) <- names(grm_fits)
+
+## 3c. Display/save each plot
+invisible(lapply(seq_along(analysis_specs), function(i) {
+  spec <- analysis_specs[[i]]
+
+  save_grm_plot(
+    grm_plots[[i]],
+    output_file = spec$file
+  )
+}))
+```
+
+# 8 Sex, age, and race DIF in the normative sample
+
+```{r dif-preparation}
+df$age_youth <- as.numeric(df[[age_source_y]])
+df$age_strata_y <- case_when(
+  df$age_youth >= 12 & df$age_youth <= 14 ~ 1L,
+  df$age_youth >= 15 & df$age_youth <= 18 ~ 2L,
+  TRUE ~ NA_integer_
+)
+
+# In the verified source, sex_select codes 1 and 2 identify the two adequately
+# sized comparison groups. Other categories are retained in the data but omitted
+# from this DIF analysis because of cell size.
+sex_rows_y <- has_nqlsy_complete & df$sex_child %in% c(1, 2)
+age_rows_y <- has_nqlsy_complete & !is.na(df$age_strata_y)
+
+# Race DIF grouping: White vs. Non-White, from the child-race checkbox item
+# race_child_m_1 ("Child's race - White"; 1 = selected, 2 = not selected).
+# Any-endorsement split, stated explicitly: a multiracial respondent who
+# checked White and another race is coded "White" here, consistent with how
+# the checkbox item itself is structured (each race is its own yes/no item,
+# not one mutually exclusive categorical field). This is a coarser grouping
+# than the full race/ethnicity breakdown in Table 1 and collapses a diverse
+# non-White group into one category -- a finer-grained analysis is a natural
+# extension for a larger or differently-stratified sample.
+df$race_white_vs_other <- case_when(
+  df$race_child_m_1 == 1 ~ "White",
+  df$race_child_m_1 == 2 ~ "Non-White",
+  TRUE ~ NA_character_
+)
+race_rows_y <- has_nqlsy_complete & !is.na(df$race_white_vs_other)
+
+collapse_sparse <- function(dat, grp, min_n = 5) {
+  dat <- as.data.frame(dat)
+  for (j in seq_len(ncol(dat))) {
+    repeat {
+      x <- dat[[j]]
+      levels_present <- sort(unique(x[!is.na(x)]))
+      x <- match(x, levels_present) - 1L
+      dat[[j]] <- x
+      k <- length(levels_present)
+      if (k <= 2) break
+      counts <- sapply(0:(k - 1), function(value) tapply(x == value, grp, sum, na.rm = TRUE))
+      sparse <- which(apply(counts, 2, min, na.rm = TRUE) < min_n)
+      if (!length(sparse)) break
+      value <- (0:(k - 1))[sparse[1]]
+      dat[[j]][dat[[j]] == value] <- if (value == k - 1) value - 1 else value + 1
+    }
+  }
+  dat
+}
+
+run_lordif <- function(data, group) {
+  lordif::lordif(
+    resp.data = as.data.frame(data), group = group, criterion = "R2",
+    R2.change = .02, alpha = .01, model = "GRM"
+  )
+}
+```
+
+```{r run-dif}
+dif_results_y <- list()
+for (scale_name in names(nqls_full_y)) {
+  items <- nqls_full_y[[scale_name]]
+  sex_data <- collapse_sparse(df[sex_rows_y, items], df$sex_child[sex_rows_y])
+  age_data <- collapse_sparse(df[age_rows_y, items], df$age_strata_y[age_rows_y])
+  race_data <- collapse_sparse(df[race_rows_y, items], df$race_white_vs_other[race_rows_y])
+
+  # lordif needs at least three items; the two-item School subscale is skipped
+  # for all three facets.
+  sex_dif  <- if (length(items) >= 3) run_lordif(sex_data, df$sex_child[sex_rows_y]) else NULL
+  age_dif  <- if (length(items) >= 3) run_lordif(age_data, df$age_strata_y[age_rows_y]) else NULL
+  race_dif <- if (length(items) >= 3) run_lordif(race_data, df$race_white_vs_other[race_rows_y]) else NULL
+
+  dif_results_y[[scale_name]] <- list(sex = sex_dif, age = age_dif, race = race_dif)
+}
+# Total Score
+dif_results_y$Total$sex$stats %>%
+  as.data.frame() %>%
+  rownames_to_column("NQLS") %>%
+  mutate(p_fdr = p.adjust(chi13, method = "BH"))
+
+dif_results_y$Total$age$stats %>%
+  as.data.frame() %>%
+  rownames_to_column("NQLS") %>%
+  mutate(p_fdr = p.adjust(chi13, method = "BH"))
+
+dif_results_y$Total$race$stats %>%
+  as.data.frame() %>%
+  rownames_to_column("NQLS") %>%
+  mutate(p_fdr = p.adjust(chi13, method = "BH"))
+
+# General Score
+dif_results_y$General$sex$stats %>%
+  as.data.frame() %>%
+  rownames_to_column("NQLS") %>%
+  mutate(p_fdr = p.adjust(chi13, method = "BH"))
+
+dif_results_y$General$age$stats %>%
+  as.data.frame() %>%
+  rownames_to_column("NQLS") %>%
+  mutate(p_fdr = p.adjust(chi13, method = "BH"))
+
+print(table(df$race_white_vs_other[race_rows_y]))
+dif_results_y$General$race$stats %>%
+  as.data.frame() %>%
+  rownames_to_column("NQLS") %>%
+  mutate(p_fdr = p.adjust(chi13, method = "BH"))
+```
+
+```{r normative-facet-invariance}
+fit_facet_invariance <- function(data, items, group_name) {
+  model <- paste0("F =~ ", paste(items, collapse = " + "))
+  fits <- list(
+    Configural = lavaan::cfa(
+      model, data = data, group = group_name, ordered = items,
+      estimator = "WLSMV", std.lv = TRUE
+    ),
+    Metric = lavaan::cfa(
+      model, data = data, group = group_name, ordered = items,
+      estimator = "WLSMV", std.lv = TRUE, group.equal = "loadings"
+    ),
+    Scalar = lavaan::cfa(
+      model, data = data, group = group_name, ordered = items,
+      estimator = "WLSMV", std.lv = TRUE,
+      group.equal = c("loadings", "thresholds")
+    )
+  )
+  imap_dfr(fits, ~ as_tibble_row(fit_values(.x)) %>%
+             mutate(model = .y, .before = 1)) %>%
+    mutate(delta_cfi = c(NA, diff(cfi)))
+}
+
+# General has enough indicators for informative facet-invariance models.
+# School has only two indicators; its configural/metric models are saturated,
+# so their global fit indices are not treated as evidence of invariance.
+general_sex_data_y <- collapse_sparse(
+  df[sex_rows_y, general_items_y], df$sex_child[sex_rows_y]
+) %>% mutate(sex_select = factor(df$sex_child[sex_rows_y]))
+
+general_age_data_y <- collapse_sparse(
+  df[age_rows_y, general_items_y], df$age_strata_y[age_rows_y]
+) %>% mutate(age_strata_y = factor(df$age_strata_y[age_rows_y]))
+
+general_sex_invariance_y <- fit_facet_invariance(
+  general_sex_data_y, general_items_y, "sex_select"
+)
+general_age_invariance_y <- fit_facet_invariance(
+  general_age_data_y, general_items_y, "age_strata_y"
+)
+general_sex_invariance_y
+general_age_invariance_y
+```
+
+# 9 Import and prepare the clinical sample
+
+```{r clinical-data}
+clinicaldata_raw <- clinical_file
+stopifnot(all(clinical_items %in% names(clinicaldata_raw)))
+
+clinicaldata <- clinicaldata_raw %>%
+  filter(!is.na(DOB), !is.na(Survey_Date)) %>%
+  mutate(
+    age = floor(lubridate::time_length(lubridate::interval(DOB, Survey_Date), "years")),
+    across(all_of(clinical_items), as.numeric),
+    NQLS_Total_Sum = ifelse(
+      complete.cases(cur_data()[clinical_items]),
+      rowSums(cur_data()[clinical_items]), NA_real_
+    )
+  ) %>%
+  filter(!is.na(NQLS_Total_Sum))
+
+map_nqls_items <- clinicaldata %>% select(all_of(clinical_items))
+
+psych::describe(map_nqls_items)
+psych::alpha(map_nqls_items)
+```
+
+```{r combine-samples}
+normativedata <- df %>%
+  select(caseid, all_of(ord_items_y)) %>%
+  rename(!!!setNames(names(norm_to_clinical), unname(norm_to_clinical))) %>%
+  mutate(
+    group = "NORM",
+    age_child = as.numeric(df[[age_source_y]]),
+    NQLS_Total_Sum = ifelse(
+      complete.cases(cur_data()[clinical_items]),
+      rowSums(across(all_of(clinical_items))), NA_real_
+    ),
+    .before = 2
+  ) %>%
+  filter(!is.na(NQLS_Total_Sum))
+
+clinicaldata <- clinicaldata %>%
+  transmute(
+    caseid = MRN,
+    group = "MAP",
+    age_child = age,
+    across(all_of(clinical_items)),
+    NQLS_Total_Sum
+  )
+
+combinedata <- bind_rows(normativedata, clinicaldata)
+invariance_data <- combinedata %>%
+  mutate(group = factor(str_trim(group), levels = c("NORM", "MAP")))
+
+table(invariance_data$group)
+lapply(clinical_items, function(item) {
+  table(invariance_data$group, invariance_data[[item]], useNA = "ifany")
+}) %>% setNames(clinical_items)
+```
+
+```{r}
+combinedplots <- combinedata %>% 
+  mutate(Sample = case_when(
+    group == "MAP" ~ "Clinical",
+    group == "NORM" ~ "Non-Clinical"))
+
+## Distribution visualization
+violin_bysample <-ggplot(combinedplots, aes(x = Sample, y = NQLS_Total_Sum, fill = Sample)) +
+  geom_violin(trim = FALSE) +
+  labs(
+    x = "",
+    y = "NQLS Total Score"
+  ) + 
+  scale_fill_manual(values = c("#4C72B0", "#0a7c0e")) +
+  theme_minimal() +
+  geom_boxplot(width = 0.4,
+               outliers = FALSE,
+               show.legend = FALSE)
+
+## Adding benchmark overlay
+violin_bysample_csb <- violin_bysample +
+  geom_hline(yintercept = 23.9, 
+             color = "black", 
+             linetype = "dashed") +
+  geom_hline(yintercept = 17.3, 
+             color = "black", 
+             linetype = "dashed") +
+  geom_hline(yintercept = 11.4, 
+             color = "black", 
+             linetype = "dashed") +
+  annotate("text", # A Benchmark
+           x = 2.45,
+           y = 24,
+           label = "A = 23.9",
+           angle = 0,
+           vjust = -0.5) +
+  annotate("text", # B Benchmark
+           x = 2.45,
+           y = 9,
+           label = "B = 11.4",
+           angle = 0,
+           vjust = -0.5) +
+  annotate("text", # C Benchmark
+           x = 2.45,
+           y = 15,
+           label = "C = 17.3",
+           angle = 0,
+           vjust = -0.5)
+
+violin_bysample
+violin_bysample_csb
+```
+
+
+```{r}
+ggsave("violin_bysample.png", width = 10, height = 6, units = "in")
+ggsave("violin_bysample_csb.png", width = 10, height = 6, units = "in")
+```
+
+
+# 10 Cross-sample measurement invariance
+
+```{r cross-sample-models-1f}
+# 1-factor
+nqls1f_invariance_model <- '
+  total =~ NQLS_Friends + NQLS_Family + NQLS_Grades + NQLS_School + NQLS_Health + NQLS_Life + NQLS_Future
+'
+fit_invariance1f <- function(equal = NULL, partial = NULL) {
+  lavaan::cfa(
+    nqls1f_invariance_model, data = invariance_data, group = "group",
+    ordered = clinical_items, estimator = "WLSMV", parameterization = "theta",
+    std.lv = TRUE, missing = "pairwise", group.equal = equal, group.partial = partial
+  )
+}
+
+fit_1f_norm <- lavaan::cfa(
+  nqls1f_invariance_model, data = filter(invariance_data, group == "NORM"),
+  ordered = clinical_items, estimator = "WLSMV", parameterization = "theta",
+  std.lv = TRUE, missing = "pairwise"
+)
+fit_1f_map <- lavaan::cfa(
+  nqls1f_invariance_model, data = filter(invariance_data, group == "MAP"),
+  ordered = clinical_items, estimator = "WLSMV", parameterization = "theta",
+  std.lv = TRUE, missing = "pairwise"
+)
+
+fit_configural1 <- fit_invariance1f()
+fit_metric1 <- fit_invariance1f("loadings")
+fit_scalar1 <- fit_invariance1f(c("loadings", "thresholds"))
+fit_partial_scalar1 <- fit_invariance1f(
+  c("loadings", "thresholds"), thresholds_to_free
+)
+fit_partial_strict1 <- fit_invariance1f(
+  c("loadings", "thresholds", "residuals"), thresholds_to_free
+)
+
+# Diagnose the scalar constraint and confirm the prespecified partial release.
+scalar_score1 <- lavaan::lavTestScore(
+  fit_scalar1, univariate = TRUE, epc = TRUE, standardized = TRUE
+)
+scalar_score1$uni
+scalar_score1$epc %>%
+  as.data.frame() %>%
+  filter(op == "|") %>%
+  arrange(desc(abs(sepc.all)))
+```
+
+
+```{r cross-sample-models-2f}
+## 2-factor
+nqls2f_invariance_model <- '
+  life   =~ NQLS_Friends + NQLS_Family + NQLS_Health + NQLS_Life + NQLS_Future
+  school =~ NQLS_Grades + NQLS_School
+'
+
+fit_invariance2f <- function(equal = NULL, partial = NULL) {
+  lavaan::cfa(
+    nqls2f_invariance_model, data = invariance_data, group = "group",
+    ordered = clinical_items, estimator = "WLSMV", parameterization = "theta",
+    std.lv = TRUE, missing = "pairwise", group.equal = equal, group.partial = partial
+  )
+}
+
+fit_2f_norm <- lavaan::cfa(
+  nqls2f_invariance_model, data = filter(invariance_data, group == "NORM"),
+  ordered = clinical_items, estimator = "WLSMV", parameterization = "theta",
+  std.lv = TRUE, missing = "pairwise"
+)
+fit_2f_map <- lavaan::cfa(
+  nqls2f_invariance_model, data = filter(invariance_data, group == "MAP"),
+  ordered = clinical_items, estimator = "WLSMV", parameterization = "theta",
+  std.lv = TRUE, missing = "pairwise"
+)
+
+fit_configural2 <- fit_invariance2f()
+fit_metric2 <- fit_invariance2f("loadings")
+fit_scalar2 <- fit_invariance2f(c("loadings", "thresholds"))
+fit_partial_scalar2 <- fit_invariance2f(
+  c("loadings", "thresholds"), thresholds_to_free
+)
+fit_partial_strict2 <- fit_invariance2f(
+  c("loadings", "thresholds", "residuals"), thresholds_to_free
+)
+
+# Diagnose the scalar constraint and confirm the prespecified partial release.
+scalar_score2 <- lavaan::lavTestScore(
+  fit_scalar2, univariate = TRUE, epc = TRUE, standardized = TRUE
+)
+scalar_score2$uni
+scalar_score2$epc %>%
+  as.data.frame() %>%
+  filter(op == "|") %>%
+  arrange(desc(abs(sepc.all)))
+```
+
+```{r invariance-table}
+invariance_fits <- list(
+  Configural1f = fit_configural1,
+  Metric1f = fit_metric1,
+  Scalar1f = fit_scalar1,
+  `Partial scalar1f` = fit_partial_scalar1,
+  `Partial strict1f` = fit_partial_strict1,
+  Configural2f = fit_configural2,
+  Metric2f = fit_metric2,
+  Scalar2f = fit_scalar2,
+  `Partial scalar2f` = fit_partial_scalar2,
+  `Partial strict2f` = fit_partial_strict2
+)
+
+invariance_table <- imap_dfr(invariance_fits, ~ {
+  as_tibble_row(fit_values(.x)) %>% mutate(model = .y, .before = 1)
+}) %>%
+  mutate(
+    delta_cfi_from_previous = c(NA, diff(cfi)),
+    supported_vs_previous = abs(delta_cfi_from_previous) <= .010
+  )
+invariance_table
+
+# WLSMV-adjusted chi-square difference tests are supplementary.
+lavTestLRT(fit_configural1, fit_metric1)
+lavTestLRT(fit_metric1, fit_scalar1)
+lavTestLRT(fit_metric1, fit_partial_scalar1)
+lavTestLRT(fit_partial_scalar1, fit_partial_strict1)
+
+lavTestLRT(fit_configural2, fit_metric2)
+lavTestLRT(fit_metric2, fit_scalar2)
+lavTestLRT(fit_metric2, fit_partial_scalar2)
+lavTestLRT(fit_partial_scalar2, fit_partial_strict2)
+```
+
+```{r latent-means}
+combinedata$group <- factor(combinedata$group, levels = c("NORM", "MAP"))
+
+## 1-factor
+nqls_mean_model_tot <- paste0(
+  nqls1f_invariance_model,
+  '\n  total ~ c(0, NA)*1\n'
+)
+
+fit_partial_scalar_means_tot <- lavaan::cfa(
+  nqls_mean_model_tot, data = invariance_data, group = "group",
+  group.label = c("NORM", "MAP"), ordered = clinical_items,
+  estimator = "WLSMV", parameterization = "theta", std.lv = TRUE,
+  missing = "pairwise", group.equal = c("loadings", "thresholds"),
+  group.partial = thresholds_to_free
+)
+
+latent_mean_results_tot <- parameterEstimates(
+  fit_partial_scalar_means_tot, ci = TRUE, level = .90
+) %>%
+  mutate(
+    sample = levels(invariance_data$group)[group],
+    p_fdr = p.adjust(pvalue, method = "BH")
+  ) %>%
+  select(sample, factor = lhs, est, se, z, pvalue, p_fdr, ci.lower, ci.upper)
+latent_mean_results_tot
+lavInspect(fit_partial_scalar_means_tot, "group.label")
+
+
+## 2-factor
+combinedata$group <- factor(combinedata$group, levels = c("NORM", "MAP"))
+
+nqls_mean_model_sub <- paste0(
+  nqls2f_invariance_model,
+  '\n  life ~ c(0, NA)*1\n  school ~ c(0, NA)*1\n'
+)
+
+fit_partial_scalar_means_sub <- lavaan::cfa(
+  nqls_mean_model_sub, data = invariance_data, group = "group",
+  group.label = c("NORM", "MAP"), ordered = clinical_items,
+  estimator = "WLSMV", parameterization = "theta", std.lv = TRUE,
+  missing = "pairwise", group.equal = c("loadings", "thresholds"),
+  group.partial = thresholds_to_free
+)
+
+latent_mean_results_sub <- parameterEstimates(
+  fit_partial_scalar_means_sub, ci = TRUE, level = .90
+) %>%
+  filter(op == "~1", lhs %in% c("life", "school")) %>%
+  mutate(
+    sample = levels(invariance_data$group)[group],
+    p_fdr = p.adjust(pvalue, method = "BH")
+  ) %>%
+  select(sample, factor = lhs, est, se, z, pvalue, p_fdr, ci.lower, ci.upper)
+latent_mean_results_sub
+lavInspect(fit_partial_scalar_means_sub, "group.label")
+```
+
+```{r observed-group-comparisons}
+observed_group_results <- map_dfr(c("NQLS_Total_Sum", clinical_items), function(variable) {
+  x <- invariance_data %>% select(group, all_of(variable)) %>% drop_na()
+  test <- t.test(x[[variable]] ~ x$group)
+  means <- x %>% group_by(group) %>% summarise(n = n(), mean = mean(.data[[variable]]),
+                                               sd = sd(.data[[variable]]), .groups = "drop")
+  pooled_sd <- sqrt(((means$n[1] - 1) * means$sd[1]^2 + (means$n[2] - 1) * means$sd[2]^2) /
+                    (sum(means$n) - 2))
+  tibble(
+    variable, n_NORM = means$n[means$group == "NORM"],
+    mean_NORM = means$mean[means$group == "NORM"], sd_NORM = means$sd[means$group == "NORM"],
+    n_MAP = means$n[means$group == "MAP"],
+    mean_MAP = means$mean[means$group == "MAP"], sd_MAP = means$sd[means$group == "MAP"],
+    difference_MAP_minus_NORM = mean_MAP - mean_NORM,
+    cohen_d = difference_MAP_minus_NORM / pooled_sd,
+    t = unname(test$statistic), df = unname(test$parameter), p = test$p.value
+  )
+}) %>%
+  mutate(p_fdr = p.adjust(p, method = "BH"))
+observed_group_results
+```
+
+# 11 Unit-weighted versus IRT scoring and change benchmarks
+
+```{r score-method-comparison}
+nqls_unit_weighted_y <- list(
+  General = rowSums(nqlsGoodItems[general_items_y]),
+  School = rowSums(nqlsGoodItems[school_items_y]),
+  Total = rowSums(nqlsGoodItems[ord_items_y])
+)
+nqls_eap_y <- imap(grm_fits_y, ~ as.numeric(mirt::fscores(.x, method = "EAP")[, 1]))
+names(nqls_eap_y) <- c("Total", "General", "School")
+
+score_correspondence_y <- tibble(
+  scale = names(nqls_eap_y),
+  r_unit_eap = map_dbl(names(nqls_eap_y), ~ stats::cor(
+    nqls_unit_weighted_y[[.x]], nqls_eap_y[[.x]]
+  ))
+)
+score_correspondence_y
+
+omega_total_for_rci <- as.numeric(omega_total_y$omega.tot)
+omega_general_for_rci <- as.numeric(omega_general_y$omega.tot)
+omega_school_for_rci <- spearman_brown_school_y
+
+rci_table_y <- imap_dfr(nqls_unit_weighted_y, function(score, scale_name) {
+  reliability <- case_when(
+    scale_name == "Total" ~ omega_total_for_rci,
+    scale_name == "General" ~ omega_general_for_rci,
+    scale_name == "School" ~ omega_school_for_rci,
+    TRUE ~ alpha_diag_y$total$raw_alpha
+  )
+  sem <- sd(score) * sqrt(1 - reliability)
+  se_diff <- sem * sqrt(2)
+  tibble(
+    scale = scale_name, mean = mean(score), sd = sd(score), reliability,
+    SEM = sem, SEdiff = se_diff, RCI90 = 1.645 * se_diff,
+    RCI95 = 1.96 * se_diff, MID_half_SD = .5 * sd(score),
+    clinical_significance_M_minus_2SD = mean(score) - 2 * sd(score),
+    empirical_P05 = unname(quantile(score, .05))
+  )
+})
+rci_table_y
+```
+
+# 12 Optional retest analyses
+
+```{r retest, eval=TRUE}
+retest_items_y <- paste0(ord_items_y, "_recon")
+retest_available_y <- all(retest_items_y %in% names(df)) &&
+  "retest_same_child_strict.youth" %in% names(df)
+
+if (retest_available_y) {
+  retest_matched_y <- df %>%
+    filter(
+      has_nqlsy_complete,
+      complete.cases(cur_data()[retest_items_y]),
+      .data[["retest_same_child_strict.youth"]] == 1
+    )
+
+  retest_r_table_y <- imap_dfr(
+    c(nqls_subscales_y, list(Total = ord_items_y)),
+    function(items, scale_name) {
+      time_1 <- rowSums(retest_matched_y[items])
+      time_2 <- rowSums(retest_matched_y[paste0(items, "_recon")])
+      test <- cor.test(time_1, time_2)
+      tibble(
+        scale = scale_name, n = length(time_1), r = unname(test$estimate),
+        ci_low = test$conf.int[1], ci_high = test$conf.int[2],
+        mean_time_1 = mean(time_1), mean_time_2 = mean(time_2)
+      )
+    }
+  )
+  retest_r_table_y
+} else {
+  message("Retest variables are unavailable; Section 12 was skipped.")
+}
+```
+
+# 13 Optional parent-youth agreement
+
+```{r cross-informant}
+parent_items_y <- paste0("nqlsp0", 1:7)
+parent_items_available_y <- all(parent_items_y %in% names(df))
+
+if (parent_items_available_y) {
+  dyads_y <- df %>%
+    filter(complete.cases(cur_data()[c(ord_items_y, parent_items_y)])) %>%
+    mutate(
+      youth_total = rowSums(across(all_of(ord_items_y))),
+      parent_total = rowSums(across(all_of(parent_items_y))),
+      dyad_mean = (youth_total + parent_total) / 2,
+      youth_minus_parent = youth_total - parent_total
+    )
+
+  cross_informant_summary_y <- tibble(
+    n = nrow(dyads_y),
+    r = cor(dyads_y$youth_total, dyads_y$parent_total),
+    mean_difference = mean(dyads_y$youth_minus_parent),
+    sd_difference = sd(dyads_y$youth_minus_parent),
+    loa_low = mean_difference - 1.96 * sd_difference,
+    loa_high = mean_difference + 1.96 * sd_difference
+  )
+  cross_informant_summary_y
+
+  summary(lm(youth_total ~ parent_total, data = dyads_y))
+  t.test(dyads_y$youth_total, dyads_y$parent_total, paired = TRUE)
+  psych::ICC(dyads_y[c("youth_total", "parent_total")])
+
+  item_agreement_y <- map2_dfr(ord_items_y, parent_items_y, function(youth_item, parent_item) {
+    tibble(
+      item = youth_item,
+      exact_agreement = mean(dyads_y[[youth_item]] == dyads_y[[parent_item]]),
+      polychoric_r = psych::polychoric(
+        dyads_y[c(youth_item, parent_item)], correct = 0
+      )$rho[1, 2]
+    )
+  })
+  item_agreement_y
+
+  ggplot(dyads_y, aes(dyad_mean, youth_minus_parent)) +
+    geom_point(alpha = .25) +
+    geom_hline(yintercept = cross_informant_summary_y$mean_difference) +
+    geom_hline(yintercept = c(cross_informant_summary_y$loa_low,
+                             cross_informant_summary_y$loa_high), linetype = 2) +
+    labs(x = "Mean of parent and youth totals", y = "Youth minus parent total") +
+    theme_minimal()
+} else {
+  message("Parent NQLS items are unavailable; cross-informant analysis was skipped.")
+}
+```
+
+# 14 Age-referenced norms
+
+```{r norming-data}
+# CLEANUP NOTE: this chunk previously fit an 8-candidate-family GAMLSS
+# comparison (ZINBI, ZANBI, ZAGA, NBI, PO, BCCG, BI, BB) across all three NQLS
+# scores (General, School, Total) via candidate_norm_fits_y/fit_gamlss(), with
+# a selected_family_y vector declaring the chosen family per score
+# (Total = "BB"). That block was never referenced again anywhere in this
+# document -- it fed no downstream table, figure, or model -- and its own
+# declaration for Total ("BB") did not match the family actually used for the
+# reported Total norms below (BCCG, chosen via the separate, Total-specific
+# candidate comparison in the next chunks: nqls_no/nqls_bccg/nqls_bcpe/
+# nqls_bb, compared by GAIC). Removed rather than left in place with a
+# declared choice that contradicted what the manuscript's reported final model
+# actually used. The General and School subscales do not yet have a
+# finalized, reported norming model in this document; building one should
+# follow the same GAIC/worm-plot/Q-statistic workflow used for Total below,
+# with its own explicit family declaration kept in sync with whatever model
+# actually gets used -- not reintroduce an unused, silently-stale comparison.
+```
+
+```{r}
+coverage <- function(model, fam, data, y, bd = NULL,
+                     cent = c(50, 75, 90, 95)) {
+  p    <- predictAll(model, data = data)
+  qfun <- get(paste0("q", fam))
+  sapply(cent, function(cc) {
+    args <- list(p = cc / 100, mu = p$mu)
+    if (!is.null(p$sigma)) args$sigma <- p$sigma
+    if (!is.null(p$nu))    args$nu    <- p$nu
+    if (!is.null(p$tau))   args$tau   <- p$tau
+    if (!is.null(bd))      args$bd    <- bd
+    mean(y <= do.call(qfun, args))
+  }) |> setNames(paste0("c", cent))
+}
+
+nqls <- df %>% 
+  select(actual_age, sex_child, nqlsytot) %>% 
+  mutate(
+    femaleyn = case_when(
+      sex_child == 2 ~ 1,
+      sex_child == 1 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    femaleyn = factor(femaleyn),
+    nqlsytot_count = round(nqlsytot),
+    nqlsytot_nonzero = nqlsytot + 0.0001
+  )
+
+nqls <- na.omit(nqls)
+
+describe(nqls$nqlsytot)
+```
+
+```{r}
+ggplot(nqls, aes(x = nqlsytot)) +
+  geom_histogram(
+    binwidth = 2,
+    fill = "skyblue",
+    color = "black"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 28),
+    breaks = seq(0, 60, by = 5)
+  ) +
+  theme_minimal()
+```
+
+```{r}
+nqls_no <- gamlss(
+  nqlsytot ~ femaleyn + pb(actual_age) + pb(actual_age, by = femaleyn),
+  sigma.formula =~ pb(actual_age),
+  family = NO,
+  data = nqls
+)
+```
+
+```{r}
+nqls_bccg <- gamlss(
+  nqlsytot_nonzero ~ femaleyn + pb(actual_age) + pb(actual_age, by = femaleyn),
+  sigma.formula =~ pb(actual_age),
+  nu.formula =~ 1,
+  family = BCCG,
+  data = nqls
+)
+```
+
+```{r}
+nqls_bcpe <- gamlss(
+  nqlsytot_nonzero ~ femaleyn + pb(actual_age) + pb(actual_age, by = femaleyn),
+  sigma.formula =~ pb(actual_age),
+  nu.formula =~ 1,
+  tau.formula =~ 1,
+  family = BCPE,
+  data = nqls
+)
+```
+
+```{r}
+nqls_bb <- gamlss(
+  cbind(nqlsytot, 28 - nqlsytot) ~ femaleyn + pb(actual_age) + pb(actual_age, by = femaleyn),
+  sigma.formula = ~ pb(actual_age),
+  family = BB,
+  data = nqls
+)
+```
+
+```{r}
+# CLEANUP NOTE: previously compared only nqls_no vs. nqls_bccg here, even
+# though nqls_bcpe and nqls_bb (fit in the two chunks above) were also
+# candidates -- the manuscript's own Methods text states "we compared
+# multiple candidate distributions," so the comparison actually shown should
+# include every family that was fit, not a subset of it.
+GAIC(nqls_no, nqls_bccg, nqls_bcpe, nqls_bb, k = log(1006))
+summary(nqls_no)
+summary(nqls_bccg)
+summary(nqls_bcpe)
+summary(nqls_bb)
+```
+
+```{r}
+bccg_worm <- wp(nqls_bccg, xvar = nqls$actual_age)
+```
+
+```{r}
+bb_worm <- wp(nqls_bb, xvar = nqls$actual_age)
+```
+
+```{r}
+qs_bb <- Q.stats(nqls_bb, xvar = nqls$actual_age, n.inter = 4)
+round(qs_bb, 2)
+```
+
+```{r}
+qs_bccg <- Q.stats(nqls_bccg, xvar = nqls$actual_age, n.inter = 4)
+round(qs_bccg, 2)
+```
+
+```{r}
+coverage(nqls_bccg, "BCCG", nqls, y = nqls$nqlsytot)
+```
+
+```{r}
+cent <- c(5, 10, 25, 50, 75, 90, 95)
+
+nqls_grid <- expand.grid(
+  actual_age = seq(12, 18, length.out = 1000),
+  femaleyn = unique(nqls$femaleyn)
+)
+
+nqls_pred <- nqls_grid
+
+## Final selection - BCCG
+
+nqls_pred$mu <- predict(nqls_bccg, newdata = nqls_grid,  what = "mu", type = "response")
+nqls_pred$sigma <- predict(nqls_bccg, newdata = nqls_grid, what = "sigma", type = "response")
+nqls_pred$nu <- predict(nqls_bccg, newdata = nqls_grid, what = "nu", type = "response")
+
+nqls_cent <- do.call(rbind, lapply(cent, function(p){
+  val <- qBCCG(p/100, mu = nqls_pred$mu, sigma = nqls_pred$sigma, nu = nqls_pred$nu)
+  data.frame(age = nqls_pred$actual_age, femaleyn = nqls_pred$femaleyn, percentile = p, value = val)
+}))
+```
+
+```{r}
+cent_level <- c(95, 90, 75, 50, 25, 10, 5)
+nqls_cent$value <- nqls_cent$value - 0.0001
+nqls_cent$percentile <- factor(nqls_cent$percentile, levels = cent_level)
+```
+
+```{r}
+colors <- c(
+  "5" = "red",
+  "10" = "purple",
+  "25" = "blue",
+  "50" = "black",
+  "75" = "#0B6623",
+  "90" = "#708238",
+  "95" = "#4CBB17"
+)
+```
+
+```{r}
+nqls_norm_male <- ggplot(nqls_cent %>% filter(femaleyn==0), aes(x = age, y = value, group = percentile)) +
+  geom_line(aes(color = percentile)) +
+  scale_color_manual(values = colors, name = "Percentile") +
+  scale_x_continuous(
+    breaks = seq(12, 18, by = 1)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 28),
+    breaks = seq(0, 28, by = 1),
+    sec.axis = sec_axis(~ ., breaks = seq(0, 28, by = 1), name = NULL)
+  ) +
+  labs(title = "Male", x = "Child Age", y = "NQLS Total (0-28)", linetype = "Percentile") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        legend.key.size = unit(0.35, "cm"),
+        legend.spacing.y = unit(0.1, "cm"),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        legend.margin = margin(2, 2, 2, 2),
+        legend.position = c(0.1, 0.2))
+
+nqls_norm_male
+```
+
+```{r}
+nqls_norm_female <- ggplot(nqls_cent %>% filter(femaleyn==1), aes(x = age, y = value, group = percentile)) +
+  geom_line(aes(color = percentile)) +
+  scale_color_manual(values = colors, name = "Percentile") +
+  scale_x_continuous(
+    breaks = seq(12, 18, by = 1)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 28),
+    breaks = seq(0, 28, by = 1),
+    sec.axis = sec_axis(~ ., breaks = seq(0, 28, by = 1), name = NULL)
+  ) +
+  labs(title = "Female", x = "Child Age", y = "NQLS Total (0-28)", linetype = "Percentile") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        legend.key.size = unit(0.35, "cm"),
+        legend.spacing.y = unit(0.1, "cm"),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        legend.margin = margin(2, 2, 2, 2),
+        legend.position = c(0.1, 0.2))
+
+nqls_norm_female
+```
+
+```{r}
+nqls_female_cent_raw <- nqls %>% 
+  filter(femaleyn == 1) |> 
+  group_by(actual_age) |> 
+  summarize(
+    p5 = quantile(nqlsytot, 0.05, na.rm = TRUE),
+    p10 = quantile(nqlsytot, 0.1, na.rm = TRUE),
+    p25 = quantile(nqlsytot, 0.25, na.rm = TRUE),
+    p50 = quantile(nqlsytot, 0.5, na.rm = TRUE),
+    p75 = quantile(nqlsytot, 0.75, na.rm = TRUE),
+    p90 = quantile(nqlsytot, 0.9, na.rm = TRUE),
+    p95 = quantile(nqlsytot, 0.95, na.rm = TRUE)
+  )
+
+nqls_male_cent_raw <- nqls %>% 
+  filter(femaleyn == 0) |> 
+  group_by(actual_age) |> 
+  summarize(
+    p5 = quantile(nqlsytot, 0.05, na.rm = TRUE),
+    p10 = quantile(nqlsytot, 0.1, na.rm = TRUE),
+    p25 = quantile(nqlsytot, 0.25, na.rm = TRUE),
+    p50 = quantile(nqlsytot, 0.5, na.rm = TRUE),
+    p75 = quantile(nqlsytot, 0.75, na.rm = TRUE),
+    p90 = quantile(nqlsytot, 0.9, na.rm = TRUE),
+    p95 = quantile(nqlsytot, 0.95, na.rm = TRUE)
+  )  
+```
+
+```{r}
+nqls_male_cent_raw_long <- nqls_male_cent_raw %>%
+  pivot_longer(cols = c(p5, p10, p25, p50, p75, p90, p95), names_to = "percentile", values_to = "value")
+
+nqls_norm_male_raw <- ggplot(nqls_cent %>% filter(femaleyn==0), aes(x = age, y = value, group = percentile)) +
+  geom_line(data = nqls_male_cent_raw_long,
+            aes(x = actual_age, y = value, group = percentile),
+            color = "lightgray", inherit.aes = FALSE) +
+  geom_line(aes(color = percentile)) +
+  scale_color_manual(values = colors, name = "Percentile") +
+  scale_x_continuous(
+    breaks = seq(12, 18, by = 1)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 28),
+    breaks = seq(0, 28, by = 1),
+    sec.axis = sec_axis(~ ., breaks = seq(0, 28, by = 1), name = NULL)
+  ) +
+  labs(title = "Male", x = "Child Age", y = "NQLS Total (0-28)", linetype = "Percentile") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        legend.key.size = unit(0.35, "cm"),
+        legend.spacing.y = unit(0.1, "cm"),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        legend.margin = margin(2, 2, 2, 2),
+        legend.position = c(0.1, 0.2))
+
+nqls_norm_male_raw
+```
+
+```{r}
+nqls_female_cent_raw_long <- nqls_female_cent_raw %>%
+  pivot_longer(cols = c(p5, p10, p25, p50, p75, p90, p95), names_to = "percentile", values_to = "value")
+
+nqls_norm_female_raw <- ggplot(nqls_cent %>% filter(femaleyn==1), aes(x = age, y = value, group = percentile)) +
+  geom_line(data = nqls_female_cent_raw_long,
+            aes(x = actual_age, y = value, group = percentile),
+            color = "lightgray", inherit.aes = FALSE) +
+  geom_line(aes(color = percentile)) +
+  scale_color_manual(values = colors, name = "Percentile") +
+  scale_x_continuous(
+    breaks = seq(12, 18, by = 1)
+  ) +
+  scale_y_continuous(
+    limits = c(0, 28),
+    breaks = seq(0, 28, by = 1),
+    sec.axis = sec_axis(~ ., breaks = seq(0, 28, by = 1), name = NULL)
+  ) +
+  labs(title = "Female", x = "Child Age", y = "NQLS Total (0-28)", linetype = "Percentile") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 10),
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 8),
+        legend.key.size = unit(0.35, "cm"),
+        legend.spacing.y = unit(0.1, "cm"),
+        legend.text = element_text(size = 6),
+        legend.title = element_text(size = 8),
+        legend.margin = margin(2, 2, 2, 2),
+        legend.position = c(0.1, 0.2))
+
+nqls_norm_female_raw
+```
+
+```{r}
+ggsave(nqls_norm_male, file = "nqls_youth_male.png", height = 4, width = 4, dpi = 300)
+ggsave(nqls_norm_female, file = "nqls_youth_female.png", height = 4, width = 4, dpi = 300)
+
+ggsave(nqls_norm_male_raw, file = "nqls_youth_male_raw.png", height = 4, width = 4, dpi = 300)
+ggsave(nqls_norm_female_raw, file = "nqls_youth_female_raw.png", height = 4, width = 4, dpi = 300)
+```
+
+```{r}
+nqls_fullyear_grid <- expand.grid(
+  actual_age = 12:18,
+  femaleyn = unique(nqls$femaleyn)
+) 
+
+nqls_fullyear_pred <- nqls_fullyear_grid
+
+nqls_fullyear_pred$mu <- predict(nqls_bccg, newdata = nqls_fullyear_grid,  what = "mu", type = "response")
+nqls_fullyear_pred$sigma <- predict(nqls_bccg, newdata = nqls_fullyear_grid, what = "sigma", type = "response")
+nqls_fullyear_pred$nu <- predict(nqls_bccg, newdata = nqls_fullyear_grid, what = "nu", type = "response")
+
+nqls_fullyear_cent <- do.call(rbind, lapply(cent, function(p){
+  val <- qBCCG(p/100, mu = nqls_fullyear_pred$mu, sigma = nqls_fullyear_pred$sigma, nu = nqls_fullyear_pred$nu)
+  data.frame(age = nqls_fullyear_pred$actual_age, femaleyn = nqls_fullyear_pred$femaleyn, centile = p, value = val)
+}))
+
+nqls_fullyear_cent$value <- nqls_fullyear_cent$value - 0.0001
+nqls_fullyear_cent$value <- pmin(pmax(nqls_fullyear_cent$value, 0), 28)
+```
+
+```{r}
+nqls_table_male <- nqls_fullyear_cent %>% 
+  filter(femaleyn == 0) %>% 
+  select(age, centile, value) %>% 
+  mutate(
+    value = round(value)
+  ) %>% 
+  pivot_wider(
+    names_from = centile,
+    values_from = value
+  ) %>%
+  arrange(age)
+
+nqls_table_female <- nqls_fullyear_cent %>% 
+  filter(femaleyn == 1) %>% 
+  select(age, centile, value) %>% 
+  mutate(
+    value = round(value)
+  ) %>% 
+  pivot_wider(
+    names_from = centile,
+    values_from = value
+  ) %>%
+  arrange(age)
+```
+
+# 15 Save analysis tables
+
+```{r save-tables}
+dir.create("nqls_outputs", showWarnings = FALSE)
+
+tables_to_save <- list(
+  descriptive_items = psych::describe(nqlsGoodItems),
+  validity_correlations = correlation_results_y,
+  validity_comparisons = results_table,
+  efa_retention = retention_summary_y,
+  cfa_comparison = cfa_comparison_y,
+  reliability = reliability_table_y,
+  grm_fit = grm_fit_table_y,
+  grm_parameters = grm_parameter_table_y,
+  cross_sample_invariance = invariance_table,
+  latent_means_tot = latent_mean_results_tot,
+  latent_means_sub = latent_mean_results_sub,
+  observed_group_comparisons = observed_group_results,
+  change_benchmarks = rci_table_y,
+  norms_female = nqls_table_female,
+  norms_male = nqls_table_male
+)
+
+iwalk(tables_to_save, ~ readr::write_csv(as.data.frame(.x),
+                                         file.path("nqls_outputs", paste0(.y, ".csv"))))
+
+iwalk(norm_tables_y, ~ readr::write_csv(.x,
+                                        file.path("nqls_outputs", paste0("norms_", tolower(.y), ".csv"))))
+```
+
+# 16 Session information
+
+```{r session-info}
+sessionInfo()
+```
